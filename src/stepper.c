@@ -49,6 +49,8 @@ struct stepper {
     struct trsync_signal stop_signal;
     // gcc (pre v6) does better optimization when uint8_t are bitfields
     uint8_t flags : 8;
+    // NULL for regular steppers; non-NULL activates inkjet nozzle mode
+    struct inkjet_pins *inkjet;
 };
 
 enum { POSITION_BIAS=0x40000000 };
@@ -56,6 +58,23 @@ enum { POSITION_BIAS=0x40000000 };
 enum {
     SF_LAST_DIR=1<<0, SF_NEXT_DIR=1<<1, SF_INVERT_STEP=1<<2, SF_NEED_RESET=1<<3,
     SF_SINGLE_SCHED=1<<4, SF_OPTIMIZED_PATH=1<<5, SF_HAVE_ADD=1<<6
+};
+
+// ============================================================
+// HPC6602 Inkjet nozzle mode
+// Replaces the E0 stepper step pulse with nozzle firing logic.
+// 12 nozzles addressed via 4 GPIO bits (pin_a..pin_d) + one
+// fire-pulse pin (pin_pulse).  The 12-bit nozzle_code bitmask
+// (values 0x000..0xFFF) selects which nozzles fire on each
+// "step" event.  0x1000 (4096) means "no fire" (idle / E1 mode).
+// ============================================================
+
+struct inkjet_pins {
+    struct timer         code_timer;       // schedules future nozzle_code updates
+    struct gpio_out      pin_a, pin_b, pin_c, pin_d, pin_pulse;
+    uint16_t             nozzle_code;      // active pattern (4096 = disabled)
+    uint16_t             pending_code;     // code to apply at code_timer.waketime
+    uint8_t              code_timer_active;
 };
 
 // Setup a stepper for the next move in its queue
@@ -390,3 +409,139 @@ stepper_shutdown(void)
     }
 }
 DECL_SHUTDOWN(stepper_shutdown);
+
+// ============================================================
+// HPC6602 Inkjet nozzle mode implementation
+// ============================================================
+
+// Fire all selected nozzles in nozzle_code one by one.
+// For each bit n (0..11) that is set: output 4-bit address on
+// pin_a/b/c/d, assert pin_pulse for ~5 µs, then clear everything.
+static void
+inkjet_fire_nozzles(struct inkjet_pins *ink)
+{
+    uint16_t code = ink->nozzle_code;
+    if (!code || code >= 4096)
+        return;
+
+    for (uint8_t n = 0; n < 12; n++) {
+        if (!(code & (1 << n)))
+            continue;
+        // Set 4-bit nozzle address
+        gpio_out_write(ink->pin_a, (n >> 0) & 1);
+        gpio_out_write(ink->pin_b, (n >> 1) & 1);
+        gpio_out_write(ink->pin_c, (n >> 2) & 1);
+        gpio_out_write(ink->pin_d, (n >> 3) & 1);
+        // Fire pulse (~5 µs)
+        gpio_out_write(ink->pin_pulse, 1);
+        uint32_t end = timer_read_time() + timer_from_us(5);
+        while (timer_is_before(timer_read_time(), end))
+            ;
+        // Clear everything
+        gpio_out_write(ink->pin_pulse, 0);
+        gpio_out_write(ink->pin_a, 0);
+        gpio_out_write(ink->pin_b, 0);
+        gpio_out_write(ink->pin_c, 0);
+        gpio_out_write(ink->pin_d, 0);
+    }
+}
+
+// Step event for inkjet steppers: fire nozzles instead of toggling step pin.
+// Uses SF_SINGLE_SCHED so each event fires exactly once per "step count".
+static uint_fast8_t
+inkjet_event_full(struct timer *t)
+{
+    struct stepper *s = container_of(t, struct stepper, time);
+
+    // Fire the nozzle pattern
+    inkjet_fire_nozzles(s->inkjet);
+
+    uint32_t curtime = timer_read_time();
+    uint32_t min_next_time = curtime + s->step_pulse_ticks;
+    uint32_t count = s->count - 1;
+    if (likely(count)) {
+        s->next_step_time += s->interval;
+        s->interval += s->add;
+        if (unlikely(timer_is_before(s->next_step_time, min_next_time)))
+            goto reschedule_min;
+        s->count = count;
+        s->time.waketime = s->next_step_time;
+        return SF_RESCHEDULE;
+    }
+    s->time.waketime = min_next_time;
+    return stepper_load_next(s);
+reschedule_min:
+    s->count = count;
+    s->time.waketime = min_next_time;
+    return SF_RESCHEDULE;
+}
+
+// MCU timer callback: apply a previously scheduled nozzle_code change.
+static uint_fast8_t
+inkjet_code_update_event(struct timer *t)
+{
+    struct inkjet_pins *ink = container_of(t, struct inkjet_pins, code_timer);
+    ink->nozzle_code = ink->pending_code;
+    ink->code_timer_active = 0;
+    return SF_DONE;
+}
+
+// Command: attach inkjet nozzle pins to an existing stepper oid.
+// Must be sent after config_stepper for the same oid.
+// The stepper's step/dir pins remain configured but are never toggled
+// while inkjet mode is active.
+void
+command_config_inkjet_nozzle(uint32_t *args)
+{
+    struct stepper *s = stepper_oid_lookup(args[0]);
+    struct inkjet_pins *ink = alloc_chunk(sizeof(*ink));
+    ink->pin_a      = gpio_out_setup(args[1], 0);
+    ink->pin_b      = gpio_out_setup(args[2], 0);
+    ink->pin_c      = gpio_out_setup(args[3], 0);
+    ink->pin_d      = gpio_out_setup(args[4], 0);
+    ink->pin_pulse  = gpio_out_setup(args[5], 0);
+    ink->nozzle_code        = 4096;  // disabled by default
+    ink->pending_code       = 4096;
+    ink->code_timer_active  = 0;
+    ink->code_timer.func    = inkjet_code_update_event;
+    s->inkjet = ink;
+    // Force single-schedule mode (one event per step) and use inkjet handler.
+    // Clear any AVR / edge optimisation flags so inkjet_event_full is used.
+    s->flags = (s->flags & ~SF_OPTIMIZED_PATH) | SF_SINGLE_SCHED;
+    s->time.func = inkjet_event_full;
+}
+DECL_COMMAND(command_config_inkjet_nozzle,
+             "config_inkjet_nozzle oid=%c pin_a=%c pin_b=%c pin_c=%c"
+             " pin_d=%c pin_pulse=%c");
+
+// Command: schedule a nozzle_code update at a specific MCU clock time.
+// Sending clock=0 applies the change immediately.
+void
+command_stepper_set_nozzle_code(uint32_t *args)
+{
+    struct stepper *s = stepper_oid_lookup(args[0]);
+    if (!s->inkjet)
+        return;
+    uint32_t waketime   = args[1];
+    uint16_t code       = (uint16_t)args[2];
+    struct inkjet_pins *ink = s->inkjet;
+
+    if (!waketime || !timer_is_before(timer_read_time(), waketime)) {
+        // Apply immediately
+        if (ink->code_timer_active) {
+            sched_del_timer(&ink->code_timer);
+            ink->code_timer_active = 0;
+        }
+        ink->nozzle_code = code;
+        return;
+    }
+    // Schedule for future clock time
+    ink->pending_code = code;
+    if (ink->code_timer_active)
+        sched_del_timer(&ink->code_timer);
+    ink->code_timer.waketime = waketime;
+    sched_add_timer(&ink->code_timer);
+    ink->code_timer_active = 1;
+}
+DECL_COMMAND(command_stepper_set_nozzle_code,
+             "stepper_set_nozzle_code oid=%c clock=%u nozzle_code=%hu");
